@@ -1,0 +1,307 @@
+#INTRODUCTION TO PROJECT----
+
+#Reef-building corals around the world are facing increased risks of extinction due to anthropogenic impacts and climate change. Among these corals are stony corals or hard corals, from the order Scleractinia. These animals (referred to individually as polyps) build themselves a hard skeleton which makes up most of the framework of coral reefs. They are very important for the ecosystem and for this reason this taxon was chosen for this exploratory analysis. 
+
+#This exploratory analysis of Scleractinia is primarily biological. The question that we will be exploring for this analysis is: What is the phylogenetic diversity of species within Scleractinia and how are they geographically distributed? This analysis will involve reconstructing phylogenetic trees to see if there are key differences between the two main ecological groups (azooxanthellate, zooxanthellate) and plotting to see if there are trends between the two groups on how they are geographically distributed. 
+
+
+#INSTALL AND LOAD PACKAGES----
+
+#Install packages from Bioconductor
+source("https://bioconductor.org/biocLite.R")
+library(readr)
+library(Biostrings)
+library(stringr)
+library(plyr)
+library(tidyverse)
+library(ape)
+library(seqRFLP)
+library(dplyr)
+library(phangorn)
+library(adegenet)
+library(ade4)
+library(stats)
+library(phytools)
+library(mapdata)
+library(msa)
+library(RSQLite)
+library(DECIPHER)
+library(rworldmap)
+
+#OBTAIN DATA FROM BOLD FOR PHYLOGENETIC ANALYSIS ----
+
+Scleractinia <- read_tsv("http://www.boldsystems.org/index.php/API_Public/combined?taxon=Scleractinia&format=tsv")
+#From BOLD, we will obtain all the available data on Scleractinia. As only one dataset is being used, this exploratory analysis is only as good as the data available from BOLD. 
+
+#write_tsv(Scleractinia, "Scleractinia_BOLD_data.tsv")
+#Scleractinia <- read_tsv("Scleractinia_BOLD_data.tsv")
+#If needed, there is the option of saving the database into the working directory and reading from the saved file directly.
+
+#EXPLORE AND FILTER DATA USING TIDYVERSE FOR PHYLOGENETIC ANALYSIS ----
+
+names(Scleractinia)
+#Generates all the variable names in the dataset that can be used for further exploration.
+
+unique(Scleractinia$markercode)
+#Generates all the unique marker codes available in the dataset. We will now find the most frequent marker code and that will be used to filter the dataset.
+
+table(Scleractinia$markercode)
+#From these results, COI-5P is the most frequent marker code. 
+
+Scleractinia.COI5P <- Scleractinia %>%
+  filter(markercode == "COI-5P") %>%
+  filter(str_detect(nucleotides, "[ACGT]"))
+#This is a subset of the main dataset that includes only records with the marker code COI-5P and nucleotide sequences.
+
+unique(Scleractinia.COI5P$species_name)
+#There are 479 unique species present in this dataset. This is too many to work with so we are going to filter out species that don't have more than 5 records. 
+
+SpeciesCount <- table(Scleractinia.COI5P$species_name)
+#This creates a table of species and the number of records available in the dataset for this species. 
+
+SpeciesRecord <- Scleractinia.COI5P %>% 
+  group_by(species_name) %>% filter(n() >=5 ) %>%
+  drop_na(species_name, markercode, nucleotides)
+#Filters the data such that species with 5 or more records are kept in the dataset and NA values for species_name, markercode, and nucleotides are dropped.
+
+total_species <- table(SpeciesRecord$species_name) 
+TotalSpecies <- as.data.frame(total_species)
+names(TotalSpecies)[names(TotalSpecies) == "Var1"] <- "Species Name" 
+names(TotalSpecies)[names(TotalSpecies) == "Freq"] <- "Number of Records"
+#Counts the unique species and their total number of records in the dataset. This is a reference dataframe to look back on during the exploration.
+
+length(SpeciesRecord$nucleotides)
+#There are 1026 sequences available and that is a lot to work with. Thus we are going to randomly sample 5 sequences per species to conduct a multiple sequence alignment.
+
+#RANDOM SAMPLING OF SEQUENCES FROM SPECIES ----
+
+RandomSample <- SpeciesRecord %>%
+  group_by(species_name) %>%
+  sample_n(2)
+#A new dataframe with random sampling is created so that there are fewer sequences to work with such that alignment is easier and visualizations are not so cluttered.
+
+RandomSampleDf <- RandomSample %>%
+  select(species_name, nucleotides, markercode, bin_uri) %>%
+  drop_na(bin_uri)
+#In this dataframe, I subsetted the random sample to includes 4 variables of interest. We are going to use BIN to annotate the dendrogram and tree so we need drop NA in bin_uri which leaves us with 132 sequence.
+
+#CONVERTING DATAFRAME INTO A DNASTRINGSET TO BE USED FOR DOWNSTREAM ANALYSIS ----
+
+class(RandomSampleDf$nucleotides)
+#In order to perform a Multiple Sequence Alignment(MSA), we need to convert the class into a DNAStringSet.
+
+RandomSampleDf$nucleotides <- DNAStringSet(RandomSampleDf$nucleotides)
+Scler.Sequence <- RandomSampleDf$nucleotides
+class(Scler.Sequence)
+#A DNAStringSet is created to be used for MSA. 
+
+#CONDUCTING A MULTIPLE SEQUENCE ALIGNMENT (MSA) USING MUSCLE ----
+
+Scler.MUSCLE <- DNAStringSet(muscle::muscle(Scler.Sequence, maxiters = 2, diags = TRUE))
+#Using the MUSCLE algorithm, an MSA is conducted. The maxiters is set to 2 because my laptop cannot handle more than 2 iterations as it results in the program crashing. Therefore, in order to account for computational power only 2 iterations are used. As this is an exploratory analysis, MUSCLE was chosen over other algorithms such as DECIPHER because of speed. MUSCLE is not only efficient with speed but it is decently accurate therefore I picked MUSCLE. If this was a hypothesis testing analysis, I would have gone for DECIPHER for optimal accuracy. 
+
+mean(unlist(lapply(Scler.MUSCLE, str_count, ("-"))))
+#The average number of gaps per sequence is 942.0074 There are a lot of gaps in the sequences which could imply that it is difficult to align the different species due to large differences at the molecular level. 
+
+names(Scler.MUSCLE) <- RandomSampleDf$bin_uri
+Scler.MUSCLE
+#Changes the names to BIN identifiers.
+
+#CLUSTERING INTO OTUs AND CREATING A DENDROGRAM----
+
+dnaBin.Scler <- as.DNAbin(Scler.MUSCLE)
+#Converting the sequences for clustering into dnaBIN object.
+
+dist.Scler <- dist.dna(dnaBin.Scler, model = "TN93")
+#Create a distance matrix using the alignment from MUSCLE. The model TN93 is chosen because it is a model of sequence evolution. The TN93 model takes into account differences between transitions and transversions. Also, it is the best option since the function IDClusters() from DECIPHER will be used.
+
+dist.Scler.DF <- as.data.frame(as.matrix(dist.Scler))
+#Created a dataframe of the distance matrix to better view any patterns in distance.
+
+table.paint(dist.Scler.DF, cleg=0, clabel.row=0.5, clabel.col=0.5)
+#A visualization of the distance matrix, where darker shades of gray represent greater distances.
+
+dend.Scler <- IdClusters(dist.Scler, method = "NJ", cutoff= 0.02, showPlot = TRUE, type = "both", verbose = TRUE) 
+#Creates both a dendogram and clusters the sequences using the NJ method.
+
+#PHLYOGENETIC DIVERSITY PLOTTED ON A WORLD MAP USING PHYLO.TO.MAP----
+
+#Acknowledgements to my peer, Aditya Nikhil Alleelar, for helping with creating the "searchlist" function and using the phylo.to.map function.
+
+#Creating a search function to be used to gather additional data for geographical distribution.
+searchlist <- function(x,y){      
+  n <- NULL
+  nn <- NULL
+  for (i in x) {
+    n <- grep(i,y)   #Returns the row numbers 
+    print(i)    #This will print the name of the search element from the list
+    print(n)    #This will print which row contains the search element
+    nn <- c(nn,n)  #Returns a vector of row number which corresponds to the input search element
+  }
+  return(nn)
+}
+#The function "searchlist" searches through a list of names in a specific variable within a dataframe (i.e. Scleractinia$bin_uri). The first arguement is the name you want to search for and the second arguement is the specific variable within a dataframe you want to search through.  
+
+GeoSeqData.Subset <- Scleractinia.COI5P %>%
+  select(nucleotides, species_name, markercode, lat, lon, bin_uri) %>%
+  drop_na(lat, lon, species_name, bin_uri)
+#Creates a dataframe that includes longitudinal and latitutdinal data for geographical distribution of species.
+
+GeoSeqData.Subset <- GeoSeqData.Subset %>% 
+  arrange(species_name)
+#Arrange the data by species name for the purposes of keeping the dataframe tidy.
+
+Unique.List <- unique(GeoSeqData.Subset$species_name) 
+#Create a list of unique species from filtered GeoSeqData.Subset that will be searched through with the searchlist function. 
+searchlist(Unique.List, GeoSeqData.Subset$species_name) 
+#Using the searchlist function, the unique list of species is searched through GeoSeqData.Subset$species_name and the returned values in the condole are the row numbers for each species. 
+
+GeoSeqData.Subset <- GeoSeqData.Subset %>% 
+  arrange(species_name,lon) #
+#Arranging the data again such that species with similar geographical information are kept together in the dataframe. This helps with visualizing the data better.
+
+GeoSeqData.Subset.1 <- GeoSeqData.Subset 
+#Create a copy of GeoSeqData.Subset so that during our selection process we still have the original to look at in case something goes wrong.
+
+GeoSeqData.Subset.2 <- ddply(GeoSeqData.Subset.1,~lon) %>% 
+  group_by(species_name,lon) %>%
+  sample_n(1)
+#This subset will split the dataframe by longitude and randomly select species_name and corresponding longitude numbers.
+
+selectlist <- searchlist(GeoSeqData.Subset.2$bin_uri, GeoSeqData.Subset$bin_uri) 
+#Using the searchlist function, we are going to look for more longitude data using the BIN identifier. 
+
+Scler.Final.Subset <- GeoSeqData.Subset[selectlist,]
+rownames(Scler.Final.Subset) <- c(1:741) 
+#Scler.Final.Subset is randomly selected data compiled according to geographical location and species. 
+
+Scler.Final.Subset$nucleotides <- DNAStringSet(Scler.Final.Subset$nucleotides)
+#Convert to a DNAStringSet to be used for the MUSCLE analysis.
+
+GeoScler.MSA <- DNAStringSet(muscle::muscle(Scler.Final.Subset$nucleotides, maxiters = 2)) 
+#Performed a MSA using MUSCLE from the muscle package. Again, MUSCLE chosen for speed and maxiter = 2 due to computational power. 
+
+names(GeoScler.MSA) <- Scler.Final.Subset$bin_uri
+GeoScler.MSA
+#Changed the names of the aligned sequences to BIN identifiers for clustering.
+
+GeoScler.BIN <- as.DNAbin(GeoScler.MSA)
+#Convert into a DNAbin object to be used to create a distance matrix for clustering.
+
+GeoScler.Dist <- dist.dna(GeoScler.BIN, model = "TN93", as.matrix = T, pairwise.deletion = F) 
+#Calculate the distance matrix by using TN93 model.
+
+GeoScler.Cluster <- IdClusters(GeoScler.Dist, method = "NJ", cutoff = 0.04, showPlot = T, type = "both", verbose = T)
+#Clustered the sequences using the NJ method with a cutoff of 0.04. This produces a dendrogram that can be used for visualizations.Neighbour joining (NJ) was used because an unrooted dendrogram was the desired output.  
+
+GeoScler.Cluster[[1]]$bin_uri <- Scler.Final.Subset$bin_uri
+GeoScler.Random <- GeoScler.Cluster[[1]][sample(nrow(GeoScler.Cluster[[1]])),] 
+#In this subset, the clusters were randomized.
+
+OTU.GeoScler <- merge(GeoScler.Ranom, Scler.Final.Subset, by ="bin_uri",  x.all=TRUE)
+#In this dataframe, the two dataframes are merged so that all the data is available to pull from.
+
+OTU.GeoScler = OTU.GeoScler[!duplicated((OTU.GeoScler$cluster)),]
+#As the sequences are in clusters, a single sequence is pulled from each cluster. 
+
+Tree.Sequences <- data.frame(OTU.GeoScler$species_name, OTU.GeoScler$nucleotides)
+dataframe2fas(Tree.Sequences, file = "GeoScler_tree.fasta")
+Final.Tree <- readDNAStringSet("GeoScler_tree.fasta", format = "fasta")
+#A dataframe is created with species name and nucleotides and a FASTA file is generated and read as a DNAStringSet. This is a necessary step to plot the phylogenetic tree on the world map. 
+
+Final.Tree.MSA <- DNAStringSet(muscle::muscle(Final.Tree, maxiters = 2, diags = TRUE))
+Dist.Tree <- dist.dna(as.DNAbin(Final.Tree.MSA), model = "TN93", as.matrix = T, pairwise.deletion = F)
+#The sequences from the file were re-aligned again using 2 iterations for the same reason as stated before.The DNAStringSet is converted to a DNAbin object and the TN93 model is used to create a distance matrix.
+
+GeoScler.Phylo <- bionj(Dist.Tree) 
+#Using the apepackage, the bionj is an improve NJ method that is used to create this tree.
+
+parsimony(GeoScler.Phylo,as.phyDat(as.DNAbin(Final.Tree.MSA))) 
+#In order to reconstruct the phylogenies, Maximum Parsimony is used because we are creating a simple tree. With maximum parsimony, the shortest possible tree is created that will explain the data. 
+
+tree <- optim.parsimony(GeoScler.Phylo, as.phyDat(as.DNAbin(Final.Tree.MSA)))
+#This will return a maximum parsimony score. 
+
+plot(tree,cex =0.6) 
+#This is a simple visualization of the phylogenetic tree. There are 3 clusters that can be seen.
+
+GeoTree <- untangle(upgma(Dist.Tree), "read.tree")
+#Unfortunately, maximum parsimony would not work for the purposes of this map so the upgma method from the ape package is used as upgma can provide a rooted treat as a result.
+
+GeoScler.Lon.Lat <- as.matrix(data.frame(OTU.GeoScler$lat, OTU.GeoScler$lon))
+#The phylo.to.map function requires coordinates so a matrix is created that has the latitude and longitude data.
+
+row.names(GeoScler.Lon.Lat) <- GeoTree$tip.label
+#The row names for the tree and the matrix need to be identical otherwise the phylo.to.map function will not work. 
+
+par(oma=c(0,0,2,0))
+
+mapplot <- phylo.to.map(GeoTree, GeoScler.Lon.Lat,plot=F)
+plot(mapplot,fsize=0.02,asp=1.2, type = "phylogram", ftype="i") 
+title(main = "Phylogenetic Relationships of Scleractinia and their Geographical Distribution")
+#Visualization of phylogenetic relationships among Scleractinia species and their geographical distribution on the world map. 
+
+#VISUALIZATION OF SPECIES DISPERSAL ON THE WORLDMAP USING RWORLDMAP----
+
+MapScler <- Scleractinia.COI5P %>%
+  group_by(species_name) %>% filter(n() >=1 ) %>%
+  select(nucleotides, species_name, country, lat, lon) %>%
+  drop_na(lat, lon, species_name, country) %>%
+  group_by(species_name, country) %>%
+  mutate(`No. of Records` = ifelse(row_number() == 1, n(), NA_integer_)) %>%
+  ungroup()
+#Created a dataframe where Number of Records for species data collected per country is made available without repeats.
+
+Na.Omit <- na.omit(MapScler, cols=c("No. of Records"))
+#Omits the rows with NA so that there are only one species that is representative per country.
+
+match <- joinCountryData2Map(Na.Omit, joinCode = "NAME", nameCountryColumn = "country", nameJoinColumn = "country")
+#This will match the countries that there are species data available for.
+
+testmap <- mapBubbles(dF=match, nameX = "lon", nameY = "lat", nameZSize = "No. of Records", nameZColour = "species_name", catMethod = "categorical", colourPalette = "rainbow", mapRegion = "world", oceanCol = "lightblue", landCol = "wheat", addLegend = FALSE, addColourLegend = FALSE)
+#Created a map that shows geographical dispersal of species. The map exclusively shows data that includes "Species Name", "Country", "Latitude", "Longitude" and the size of the bubbles represents the number of records available for a specific species collected from that country.  
+
+title(main = "Geographical Dispersals of Species in Scleractinia")
+#This will add a title.
+
+do.call( addMapLegendBoxes, c(testmap,x='bottom',title="Species Name", catMethod = "categorical", cex=0.7))
+#Adds a legend to the worldmap to identify where the species have been plotted.
+
+#CALCULATING AND VISUALIZING NUCLEOTIDE FREQUENCIES----
+
+Sequence.List <- as.list(Scler.Sequence)
+LargeDNAStringSet <- DNAStringSet(Sequence.List) 
+writeXStringSet(LargeDNAStringSet, 'Sequence.List.fasta')
+#Created a FASTA file of the sequences that include numbers to indicate species name. 
+writeXStringSet(Scler.MUSCLE, 'Scler.fasta')
+#Created a FASTA file of the aligned sequences.
+
+#Calculating and Visualizing Nucleotide Frequencies for Raw Sequences
+
+Scler.Raw <- readDNAStringSet("Sequence.List.fasta","fasta")
+#Read the raw sequences FASTA file to determine nucleotide frequencies. 
+Freq.Percentage.1 <- alphabetFrequency(Scler.Raw, as.prob = T,baseOnly=T)
+#Count the number of bases (ATGC and other) per each sequence, there are 132 in total The result is a matrix where the numbers are a percentage of the bases per each sequence.
+
+#Calculating and Visualizing Nucleotide Frequencies for Aligned Sequences
+Scler.Align <- readDNAStringSet("Scler.fasta","fasta")
+#Read the aligned MSA fasta file to determine nucleotide frequencies. 
+Freq.Percentage <- alphabetFrequency(Scler.Align, as.prob = T,baseOnly=T)
+#Count the number of bases (ATGC and other) per each sequence, there are 132 in total The result is a matrix where the numbers are a percentage of the bases per each sequence.
+
+#Visualize the two plots side-by-side
+
+par(mfrow=c(1,2))
+#Split the plot view into two so that both plots can be visualized next to each other. 
+
+matplot(Freq.Percentage.1,type='l', xlab = "Sequences (n = 132)", ylab = "Nucleotide Frequencies", main = "Nucleotide Frequencies of Raw Scleractinia Sequences")
+#Plot a line graph to represent each sequence and the percentage of nucleotides in each sequence.
+legend(legend = colnames(Freq.Percentage.1),"topright",lty=1:5,col=1:5)
+#Add a legend to the plot for better assessment. 
+
+matplot(Freq.Percentage,type='l', xlab = "Sequences (n = 132)", ylab = "Nucleotide Frequencies", main = "Nucleotide Frequencies of Aligned Scleractinia Sequences")
+#Plot a line graph to represent each sequence and the percentage of nucleotides in each sequence.
+legend(legend = colnames(Freq.Percentage),"topright",lty=1:5,col=1:5)
+#Add a legend to the plot for better assessment. 
+
+par(mfrow=c(1,1))
